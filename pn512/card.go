@@ -32,19 +32,13 @@ func (d *Device) Wakeup() ([2]byte, error) { return d.requestOrWake(piccWUPA) }
 func (d *Device) requestOrWake(cmd uint8) ([2]byte, error) {
 	var atqa [2]byte
 
-	// ValuesAfterColl must be 0 for the bitwise anticollision
-	// that follows (ref: PN512 rev 5.3, 8.2.1.15).
-	if err := d.writeReg(regColl, 0x00); err != nil {
-		return atqa, err
-	}
-
 	buf := d.fifo[:2]
-	n, _, err := d.transceive([]byte{cmd}, 7, buf, 0)
+	n, lastBits, err := d.transceive([]byte{cmd}, 7, buf, 0)
 	if err != nil {
 		return atqa, err
 	}
 
-	if n != 2 {
+	if n != 2 || lastBits != 0 {
 		return atqa, ErrShortFrame
 	}
 	atqa[0], atqa[1] = buf[0], buf[1]
@@ -94,11 +88,17 @@ func (d *Device) ReadCard() (Card, error) {
 func (d *Device) cascadeLevel(sel uint8) (uid [4]byte, sak uint8, err error) {
 	buf := d.fifo[:16]
 
-	n, _, err := d.transceive([]byte{sel, nvbNoUID}, 0, buf, 0)
+	if err = d.writeReg(regColl, 0x00); err != nil {
+		return
+	}
+	n, lastBits, err := d.transceive([]byte{sel, nvbNoUID}, 0, buf, 0)
+	if e := d.writeReg(regColl, collValuesAfterColl); e != nil && err == nil {
+		err = e
+	}
 	if err != nil {
 		return
 	}
-	if n != 5 {
+	if n != 5 || lastBits != 0 {
 		err = ErrShortFrame
 		return
 	}
@@ -117,11 +117,11 @@ func (d *Device) cascadeLevel(sel uint8) (uid [4]byte, sak uint8, err error) {
 		return
 	}
 
-	n, _, err = d.transceive(frame[:], 0, buf, 0)
+	n, lastBits, err = d.transceive(frame[:], 0, buf, 0)
 	if err != nil {
 		return
 	}
-	if n != 3 {
+	if n != 3 || lastBits != 0 {
 		err = ErrShortFrame
 		return
 	}
@@ -140,7 +140,7 @@ func (d *Device) cascadeLevel(sel uint8) (uid [4]byte, sak uint8, err error) {
 // Halt puts the selected card into HALT. Call it when done with a card, or the
 // next poll will fail once before the card answers again.
 // Send HLTA encrypted after successful authentication, or the card will refuse.
-func (d *Device) Halt() error {
+func (d *Device) Halt() (err error) {
 	var frame [4]byte
 	frame[0] = piccHLTA
 	frame[1] = 0x00
@@ -155,15 +155,21 @@ func (d *Device) Halt() error {
 		if err = d.setTimeout(time.Millisecond); err != nil {
 			return err
 		}
-		defer d.setTimeout(saved)
+		defer func() {
+			if e := d.setTimeout(saved); e != nil && err == nil {
+				err = e
+			}
+		}()
 	}
 
 	_, _, err = d.transceive(frame[:], 0, d.fifo[:4], 0)
-	if err == ErrNoCard || err == ErrTimeout {
-		return nil
+	if err == ErrNoCard {
+		err = nil
+		return
 	}
 	if err != nil {
-		return err
+		return
 	}
-	return ErrProtocol
+	err = ErrProtocol
+	return
 }

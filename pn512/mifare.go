@@ -27,18 +27,19 @@ const (
 	programTime = 20 * time.Millisecond
 )
 
-// Authenticate opens a CRYPTO1 session on the sector holding block. Only the
-// first four UID bytes are used. The session lasts until the card is halted or
-// leaves the field, so call Release when finished.
+// Authenticate opens a CRYPTO1 session on the sector holding block. The session
+// lasts until the card is halted or leaves the field, so call Release when
+// finished. Pass the whole UID. A 7-byte UID authenticates with its last four
+// bytes, and this picks them.
 //
 // Call Authenticate again to switch sectors. Clearing the crypto unit in
 // between breaks the next authentication.
 func (d *Device) Authenticate(keyType KeyType, block uint8, key [6]byte, uid []byte) error {
-	if len(uid) < 4 {
-		return ErrProtocol
+	if len(uid) != 4 && len(uid) != 7 {
+		return ErrInvalidArgument
 	}
 	if keyType != KeyA && keyType != KeyB {
-		return ErrProtocol
+		return ErrInvalidArgument
 	}
 
 	return d.timed(commandTime, func() error {
@@ -52,7 +53,7 @@ func (d *Device) authenticate(keyType KeyType, block uint8, key [6]byte, uid []b
 	frame[0] = uint8(keyType)
 	frame[1] = block
 	copy(frame[2:8], key[:])
-	copy(frame[8:12], uid[:4])
+	copy(frame[8:12], uid[len(uid)-4:])
 
 	d.diag = Diag{}
 
@@ -75,7 +76,7 @@ func (d *Device) authenticate(keyType KeyType, block uint8, key [6]byte, uid []b
 		return err
 	}
 
-	deadline := time.Now().Add(100 * time.Millisecond)
+	deadline := time.Now().Add(d.timeout + 100*time.Millisecond)
 	var irq uint8
 	done := false
 	for time.Now().Before(deadline) {
@@ -89,7 +90,12 @@ func (d *Device) authenticate(keyType KeyType, block uint8, key [6]byte, uid []b
 		}
 		runtime.Gosched()
 	}
-	d.diag.IRq = irq
+	d.diag.IRQ = irq
+
+	if err := d.writeReg(regCommand, cmdIdle); err != nil {
+		return err
+	}
+
 	if !done {
 		return ErrTimeout
 	}
@@ -153,6 +159,7 @@ func (d *Device) ReadBlock(block uint8) ([16]byte, error) {
 	}
 	// A card that refuses the read answers with four bits.
 	if n == 1 && lastBits == 4 {
+		d.diag.NAK = buf[0] & 0x0F
 		if err := nackError(buf[0] & 0x0F); err != nil {
 			return out, err
 		}
@@ -214,16 +221,24 @@ func (d *Device) mifareCommand(cmd, arg uint8) error {
 	return d.exchangeACK(frame[:])
 }
 
-// mifareData sends a data phase and waits for its acknowledgement.
-func (d *Device) mifareData(data []byte) error {
+// dataFrame builds a data phase frame in the FIFO buffer with its CRC_A.
+func (d *Device) dataFrame(data []byte) ([]byte, error) {
 	buf := d.fifo[:len(data)+2]
 	copy(buf, data)
 	lo, hi, err := d.crc(data)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	buf[len(data)], buf[len(data)+1] = lo, hi
+	return buf, nil
+}
 
+// mifareData sends a data phase and waits for its acknowledgement.
+func (d *Device) mifareData(data []byte) error {
+	buf, err := d.dataFrame(data)
+	if err != nil {
+		return err
+	}
 	return d.timed(programTime, func() error { return d.exchangeACK(buf) })
 }
 
@@ -318,12 +333,16 @@ func (d *Device) ReadValue(block uint8) (int32, uint8, error) {
 	return DecodeValue(b)
 }
 
-// IncrementValue adds delta to a value block.
+// IncrementValue adds delta to a value block and leaves the result in the
+// card's transfer buffer. The block itself only changes once TransferValue
+// writes the buffer back.
 func (d *Device) IncrementValue(block uint8, delta int32) error {
 	return d.valueOp(piccIncrement, block, delta)
 }
 
-// DecrementValue subtracts delta from a value block.
+// DecrementValue subtracts delta from a value block and leaves the result in
+// the card's transfer buffer. The block itself only changes once TransferValue
+// writes the buffer back.
 func (d *Device) DecrementValue(block uint8, delta int32) error {
 	return d.valueOp(piccDecrement, block, delta)
 }
@@ -359,8 +378,13 @@ func (d *Device) valueOp(cmd, block uint8, operand int32) error {
 	arg[2] = uint8(u >> 16)
 	arg[3] = uint8(u >> 24)
 
-	err = d.mifareData(arg[:])
-	if err == ErrNoCard || err == ErrTimeout {
+	buf, err := d.dataFrame(arg[:])
+	if err != nil {
+		return err
+	}
+
+	err = d.timed(programTime, func() error { return d.exchangeACK(buf) })
+	if err == ErrNoCard {
 		// Part 2 of these three commands is not acknowledged, so silence is
 		// the success case and only an explicit NACK is a failure (ref: 12.4).
 		return nil
@@ -431,5 +455,5 @@ func trailerBlock(sector uint8) (uint8, error) {
 	case sector < 40:
 		return 128 + (sector-32)*16 + 15, nil
 	}
-	return 0, ErrProtocol
+	return 0, ErrInvalidArgument
 }

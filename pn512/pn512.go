@@ -44,9 +44,13 @@ var (
 	// ErrBCC is returned when a UID and the check byte sent with it disagree.
 	ErrBCC = errors.New("pn512: UID checksum mismatch")
 
-	// ErrBufferOver is returned when a frame does not fit the chip's FIFO,
-	// or a reply does not fit the buffer prepared for it.
-	ErrBufferOver = errors.New("pn512: buffer overflow")
+	// ErrBufferOverflow is returned when a frame does not fit the chip's
+	// FIFO, or a reply does not fit the buffer prepared for it.
+	ErrBufferOverflow = errors.New("pn512: buffer overflow")
+
+	// ErrInvalidArgument us returned when a call is made with an argument
+	// this driver cannot use.
+	ErrInvalidArgument = errors.New("pn512: invalid argument")
 
 	// ErrShortFrame is returned when an exchange succeeded and the reply
 	// was not the length the protocol requires.
@@ -60,6 +64,10 @@ var (
 	// ErrBadGain is returned by Configure when Config.Gain has bits set
 	// outside the receiver gain field.
 	ErrBadGain = errors.New("pn512: receiver gain out of range")
+
+	// ErrBadTimeout is returned by Configure when Config.Timeout is longer
+	// than the chip's timer can count. See MaxTimeout.
+	ErrBadTimeout = errors.New("pn512: timeout out of range")
 
 	// ErrAuthFailed is returned by Authenticate when the card did not
 	// accept the key. A wrong key, or the wrong key type for the sector,
@@ -95,6 +103,13 @@ var (
 	ErrChipReset = errors.New("pn512: chip lost its configuration, reset it")
 )
 
+// One timer tick in nanoseconds, as a fraction.
+const tickNum, tickDen = 169525000, 339
+
+// MaxTimeout is the longest Config.Timeout the chip can be given. The reload
+// value is 16 bits, so 0xFFFF ticks is the ceiling.
+const MaxTimeout = 0xFFFF * tickNum / tickDen * time.Nanosecond
+
 // Gain sets the sensitivity of the receiver.
 type Gain uint8
 
@@ -117,7 +132,7 @@ type Config struct {
 	Gain Gain
 
 	// Timeout is how long the chip waits for a card to answer before
-	// giving up. 0 means 1ms.
+	// giving up. 0 means 1ms, and MaxTimeout is the ceiling.
 	Timeout time.Duration
 }
 
@@ -138,8 +153,8 @@ type Device struct {
 // Diag is the chip's view of the last exchange.
 // Useful when the sentinel error is correct but not enough to debug with.
 type Diag struct {
-	// IRq is CommIRqReg as the poll loop last read it.
-	IRq uint8
+	// IRQ is CommIRqReg as the poll loop last read it.
+	IRQ uint8
 
 	// Error is ErrorReg, or 0 if the exchange never got that far.
 	Error uint8
@@ -155,13 +170,13 @@ type Diag struct {
 	// 0x83 means the antenna drivers were on. 0x80 is the reset value.
 	TxControl uint8
 
-	// NAK is the card's raw four-bit refusal.
+	// NAK is the card's raw four-bit answer.
 	NAK uint8
 }
 
 // BufferLost reports whether the card's last refusal also invalidated its
-// transfer buffer. It is only meaningful after Increment, Decrement, Restore,
-// or Transfer returned an error.
+// transfer buffer. It is only meaningful after IncrementValue, DecrementValue,
+// RestoreValue or TransferValue returned an error.
 func (d Diag) BufferLost() bool { return bufferLost(d.NAK) }
 
 // Diag returns the chip's view of the last exchange.
@@ -228,7 +243,12 @@ func (d *Device) Configure(cfg Config) error {
 		return err
 	}
 
-	return d.SetAntenna(true)
+	if err := d.SetAntenna(true); err != nil {
+		return err
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	return nil
 }
 
 // Connected reports whether a PN512 answers at the configured address.
@@ -294,13 +314,16 @@ func (d *Device) setTimeout(t time.Duration) error {
 	if t <= 0 {
 		t = time.Millisecond
 	}
-	d.timeout = t
+	if t > MaxTimeout {
+		return ErrBadTimeout
+	}
 
 	const prescaler = 0xD3E
 
-	// At TPrescaler = 0xD3E, one tick is (2*3390 + 1) / 13.56MHz = 500.07us.
-	// Dividing by 499us instead to always round up the result.
-	ticks := min(max(t/(499*time.Microsecond), 1), 0xFFFF)
+	// At TPrescaler = 0xD3E one tick is (2*3390 + 1) / 13.56MHz, which is
+	// 169525/339 us. Round up so a timeout is never short.
+	ticks := (int64(t)*tickDen + tickNum - 1) / tickNum
+	ticks = max(ticks, 1)
 
 	if err := d.writeReg(regTMode, 0x80|uint8(prescaler>>8)); err != nil {
 		return err
@@ -311,7 +334,12 @@ func (d *Device) setTimeout(t time.Duration) error {
 	if err := d.writeReg(regTReloadH, uint8(ticks>>8)); err != nil {
 		return err
 	}
-	return d.writeReg(regTReloadL, uint8(ticks))
+	if err := d.writeReg(regTReloadL, uint8(ticks)); err != nil {
+		return err
+	}
+
+	d.timeout = t
+	return nil
 }
 
 // readReg reads one register.
@@ -348,7 +376,7 @@ func (d *Device) clearBits(reg, mask uint8) error {
 // writeFIFO loads bytes into the 64-byte FIFO in a single transaction (ref: 9.4.6).
 func (d *Device) writeFIFO(data []byte) error {
 	if len(data) > len(d.wbuf)-1 {
-		return ErrBufferOver
+		return ErrBufferOverflow
 	}
 	d.wbuf[0] = regFIFOData
 	n := copy(d.wbuf[1:], data)
@@ -424,7 +452,7 @@ func (d *Device) transceive(send []byte, sendLastBits uint8, recv []byte, rxAlig
 		return
 	}
 
-	deadline := time.Now().Add(100 * time.Millisecond)
+	deadline := time.Now().Add(d.timeout + 100*time.Millisecond)
 	var irq uint8
 	done := false
 	for time.Now().Before(deadline) {
@@ -441,7 +469,7 @@ func (d *Device) transceive(send []byte, sendLastBits uint8, recv []byte, rxAlig
 		}
 		runtime.Gosched()
 	}
-	d.diag.IRq = irq
+	d.diag.IRQ = irq
 
 	if e := d.writeReg(regBitFraming, framing); e != nil {
 		err = e
@@ -470,7 +498,7 @@ func (d *Device) transceive(send []byte, sendLastBits uint8, recv []byte, rxAlig
 	d.diag.Error = errReg
 	switch {
 	case errReg&errBufferOv != 0:
-		err = ErrBufferOver
+		err = ErrBufferOverflow
 		return
 	case errReg&errParity != 0:
 		err = ErrParity
@@ -489,7 +517,7 @@ func (d *Device) transceive(send []byte, sendLastBits uint8, recv []byte, rxAlig
 	}
 	d.diag.N = int(level)
 	if int(level) > len(recv) {
-		err = ErrBufferOver
+		err = ErrBufferOverflow
 		return
 	}
 	for i := 0; i < int(level); i++ {

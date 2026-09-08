@@ -101,6 +101,11 @@ const (
 	txRFEn = 1<<1 | 1<<0 // Tx2RFEn (bit 1) and Tx1RFEn (bit 0)
 )
 
+// CollReg bits (ref: 8.2.1.15, table 46).
+const (
+	collValuesAfterColl = 1 << 7
+)
+
 // ControlReg bits (ref: 8.2.1.13, table 42).
 const (
 	ctrlInitiator = 1 << 4
