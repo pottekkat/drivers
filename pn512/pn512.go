@@ -48,7 +48,7 @@ var (
 	// FIFO, or a reply does not fit the buffer prepared for it.
 	ErrBufferOverflow = errors.New("pn512: buffer overflow")
 
-	// ErrInvalidArgument us returned when a call is made with an argument
+	// ErrInvalidArgument is returned when a call is made with an argument
 	// this driver cannot use.
 	ErrInvalidArgument = errors.New("pn512: invalid argument")
 
@@ -253,10 +253,6 @@ func (d *Device) Configure(cfg Config) error {
 
 // Connected reports whether a PN512 answers at the configured address.
 func (d *Device) Connected() bool {
-	d.wbuf[0] = regVersion
-	if err := d.bus.Tx(d.addr, d.wbuf[:1], nil); err != nil {
-		return false
-	}
 	v, err := d.Version()
 	if err != nil {
 		return false

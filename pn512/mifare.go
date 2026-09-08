@@ -6,6 +6,7 @@ import (
 )
 
 // ref: NXP MF1S50YYX_V1 datasheet (Rev. 3.2 - 23 May 2018, 279232)
+// https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
 
 // KeyType selects which of a sector's two keys an authentication offers.
 type KeyType uint8
